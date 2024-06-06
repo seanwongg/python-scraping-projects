@@ -1,0 +1,347 @@
+# Packages
+import pandas as pd
+import os
+import re
+import time
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from bs4 import BeautifulSoup
+import random
+import psycopg2 as pg
+import pandas.io.sql as psql
+from datetime import date
+import datetime as dt 
+
+# Scraping 
+scrolls = 150 
+main_url = 'https://kream.co.kr/social/tags/ootd'
+
+
+def scrape_post(driver, post_url):
+    try:
+        print(f"Scraping post: {post_url}")
+        driver.get(post_url)
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CLASS_NAME, 'full_width'))) 
+        time.sleep(10)  # adding sleep to ensure page loads
+
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+
+        pagination = soup.find('div', {'class': 'flicking-pagination'})
+        num_images = len(pagination.find_all('span', {'class': 'flicking-pagination-bullet'})) if pagination else 1
+
+        image_elements = soup.find_all('picture', {'class': 'social_img'})[:num_images]
+        image_urls = [img.find('img')['src'] for img in image_elements]
+
+        caption = soup.find('div', {'class': 'social_text'}).get_text(strip=True)
+        username = soup.find('span', {'class': 'user_name'}).get_text(strip=True)
+
+        product_links = [f"https://kream.co.kr{link['href']}" for link in soup.find_all('a', {'class': 'product_link'})]
+        product_links_str = ', '.join(product_links)
+
+        return {
+            'post_url': post_url,
+            'image_urls': ', '.join(image_urls),
+            'caption': caption,
+            'username': username,
+            'product_links': product_links_str
+        }
+    except Exception as e:
+        print(f"Error scraping post {post_url}: {e}")
+        return None
+
+def scrape_main_page(driver, main_url, scroll_to_end=True, scroll_count=5):
+    driver.get(main_url)
+    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CLASS_NAME, 'full_width'))) 
+
+    print(f"Scraping main page: {main_url}")
+
+    visited_post_urls = set()
+
+    if scroll_to_end:
+        last_height = driver.execute_script("return document.body.scrollHeight")
+        while True:
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(10)
+            new_height = driver.execute_script("return document.body.scrollHeight")
+            if new_height == last_height:
+                break
+            last_height = new_height
+    else:
+        for _ in range(scroll_count): # to scroll X times
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(10)
+
+
+    soup = BeautifulSoup(driver.page_source, 'html.parser')
+    post_links = soup.find_all('a', href=re.compile('/social/posts/'))
+
+    print(f"Number of post links found: {len(post_links)}")
+    
+    post_urls = []
+    for link in post_links:
+        post_url = f"https://kream.co.kr{link['href']}"
+        if post_url not in visited_post_urls:
+            visited_post_urls.add(post_url)
+            post_urls.append(post_url)
+
+    return post_urls
+
+
+driver = webdriver.Chrome()
+
+# edit scroll to end or scroll count HERE
+post_urls = scrape_main_page(driver, main_url, scroll_to_end=False, scroll_count=scrolls)
+all_data = []
+
+for url in post_urls:
+    post_data = scrape_post(driver, url)
+    if post_data:
+        all_data.append(post_data)
+        print(f"Successfully appended {url}")
+    else:
+        print(f"Failed to scrape {url}")
+        
+df = pd.DataFrame(all_data)
+df.to_csv('scraped_data3.csv', index=False, encoding='utf-8') # if want to store as dataframe
+df1 = df
+df1 = df1.drop(['post_url','caption'], axis = 1)
+
+# keep only first picture per post
+df1['image_urls'] = df1['image_urls'].str.extract(r'^([^,]*)')
+df1['product_links'] = df1['product_links'].str.extract(r'^([^,]*)')
+df1['image_urls'] = df1['image_urls'].fillna(df1['image_urls'])
+df1['product_links'] = df1['product_links'].fillna(df1['product_links'])
+
+# if want all pictures per post
+# df1['image_urls'] = df1['image_urls'].str.split(', ')
+# df1['product_links'] = df1['product_links'].str.split(', ')
+# df2 = df1.explode('image_urls', ignore_index = True)
+# df2 = df2.explode('product_links', ignore_index = True)
+
+# Linking with Internal Database (pgAdmin)
+DbMain = pg.connect(
+     host="XXX",
+     database="YYY",
+     user="ZZZ",
+     password="hihihi")
+
+# to join product_id via kream_url
+internal_AT = psql.read_sql('''
+SELECT p.product_id as product_id, p.kream_url as product_links, p.product_name, p.mpn_sku, p.nickname, p.silhouette, p.browse_level_2, p.browse_level_3, p.browse_level_4 FROM product_base p''', DbMain)
+internal_AT = internal_AT.rename(columns = {'product_id' : 'Product ID'})
+DbMain.close()
+
+# if there are duplicates, keep smaller product_id
+def keep_smaller_product_id(df):
+    duplicates = df[df.duplicated(subset='product_links', keep=False)]
+    duplicated_links = duplicates['product_links'].unique()
+    for link in duplicated_links:
+        subset = df[df['product_links'] == link]
+        # check
+        if subset['Product ID'].nunique() == len(subset):
+            min_product_id = subset['Product ID'].min()
+            df = df.drop(subset[subset['Product ID'] != min_product_id].index)
+    
+    return df
+
+internal_AT = keep_smaller_product_id(internal_AT)
+internal_AT = internal_AT[internal_AT['product_links'] != "None"]
+internal_AT = internal_AT.drop_duplicates(subset=['product_links'])
+internal_AT = internal_AT[internal_AT['product_links'] != "None"]
+
+# create a tagging name for caption generation
+def create_tagging_name(row):
+    mpn_sku = str(row['mpn_sku']) 
+    product_name = row['product_name']
+    if mpn_sku == 'None':
+        return product_name
+    elif mpn_sku != 'None' and mpn_sku not in product_name:
+        return product_name
+    else:
+        return product_name.replace(mpn_sku, '').strip()
+
+internal_AT['tagging_name'] = internal_AT.apply(create_tagging_name, axis=1)
+internal_AT = internal_AT.drop(['product_name','mpn_sku'], axis = 1)
+internal_AT = internal_AT.drop_duplicates()
+
+final_df = pd.merge(df1, internal_AT, on = "product_links", how="left")
+final_df1 = final_df[final_df['Product ID'].notna()]
+final_df1['Product ID'] = final_df1['Product ID'].astype(int)
+final_df1 = final_df1.drop(['product_links'], axis = 1)
+
+# Tagging
+final_df1['nickname'] = final_df1['nickname'].astype(str)
+final_df1['silhouette'] = final_df1['silhouette'].astype(str)
+final_df1['browse_level_2'] = final_df1['browse_level_2'].astype(str)
+final_df1['browse_level_3'] = final_df1['browse_level_3'].astype(str)
+final_df1['browse_level_2'] = final_df1['browse_level_4'].astype(str)
+final_df1['silhouette'] = final_df1['silhouette'].astype(str)
+final_df1['tagging_name'] = final_df1['tagging_name'].astype(str)
+def modify_tagging_name(row):
+    tagging_name = row['tagging_name']
+    nickname = row['nickname']
+    silhouette = row['silhouette']
+    browse_level_2 = row['browse_level_2']
+    browse_level_3 = row['browse_level_3']
+    browse_level_4 = row['browse_level_4']
+    if "Nike" in tagging_name:
+        if silhouette != "None":
+            return silhouette + " " + nickname
+        elif browse_level_2 != "None":
+            return browse_level_2 + " " + nickname
+        elif browse_level_3 != "None":
+            return "Nike " + browse_level_3 + " " + nickname
+        else:
+            return "Nike " + nickname
+    elif "Jordan" in tagging_name:
+        if silhouette != "None":
+            return silhouette + " " + nickname
+        elif browse_level_2 != "None":
+            return browse_level_2 + " " + nickname
+        elif browse_level_3 != "None":
+            return "Jordan " + browse_level_3 + " " + nickname
+        else:
+            return "Jordan " + nickname
+    elif "New Balance" in tagging_name:
+        numericals = re.findall(r'\d+', tagging_name)
+        return "New Balance " + ' '.join(numericals)
+    elif "Samba" in tagging_name:
+        return "Samba"
+    elif 'Yeezy Slide' not in tagging_name and 'Yeezy GAP' not in tagging_name and 'Yeezy' in tagging_name:
+        numericals = re.findall(r'\d+', tagging_name)
+        return "Yeezy " + ' '.join(numericals)
+    else:
+        return tagging_name
+    
+final_df1['product_name'] = final_df1.apply(modify_tagging_name, axis = 1)
+final_df1['product_name'] = final_df1['product_name'].str.replace('(Women)', '', regex=False)
+
+# Caption Generation (GEMINI)
+# import sys
+# !{sys.executable} -m pip install -q -U google-generativeai
+
+import pathlib
+import textwrap
+
+import google.generativeai as genai
+from IPython.display import display
+from IPython.display import Markdown
+
+def to_markdown(text):
+    text = text.replace('•', '  *')
+
+    return Markdown(textwrap.indent(text, '> ', predicate=lambda _: True))
+
+GOOGLE_API_KEY = 'KEY_HERE'
+genai.configure(api_key = GOOGLE_API_KEY)
+
+model = genai.GenerativeModel('gemini-pro')
+# to_markdown(response.text)
+## FOR IMAGE-BASED
+# model = genai.GenerativeModel('gemini-pro-vision')
+# response = model.generate_content(prompt)
+# prompt = [f"Write a short caption regarding this image related to fashion using first-person pronouns such as 'i', 'we', 'me', 'us', 'my'. ",
+#             f"The caption should have a core message (examples: 'just copped', 'unboxed', 'obsessed with my new') ",
+#             f" and mention the product name and details. It should also highlight features or colours, or share a story behind the purchase (examples: 'been waiting for these'). ",
+#             f"The less words the better. The sentences must be complete sentences. Do not always start the caption with 'finally got' and do not always say 'unreal'",
+#              f"If the image appears overloaded with text resembling an advertisement or promotional material, such as the inclusion of words like 'sale', 'promotion', or a brand name, initiate the generation with the phrase 'AD ALERT'"]
+# prompt = ''.join(prompt)
+# directory = 'C:Directory\\here'
+# def generate_caption(file_name, prompt, model):
+#     time.sleep(30)
+#     try:
+#         img = PIL.Image.open(directory + '\\' + file_name)
+#         response = model.generate_content([prompt, img], stream=True)
+#                                          # safety_settings = {'HARRASSMENT' : 'block_none',
+#                                          #                   'SEXUALLY_EXPLICITY' : 'block_none',
+#                                          #                   'HATE_SPEECH' : 'block_none',
+#                                          #                   'DANGEROUS_CONTENT' : 'block_none'})
+#         response.resolve()
+#         print(f"done for {file_name}")
+#         return response.text
+#     except Exception as e:
+#         print(f"Error processing image '{file_name}': {e}")
+#         return None
+
+# final_df1['Caption'] = final_df1['File Name'].apply(lambda x: generate_caption(x, prompt, model))
+# Define the prompt function with f-string formatting
+def prompt(product_name, nickname):
+    text = (f"Assume you are a happy customer that just got your fashion purchase of the product, {product_name}. ",
+            f"Create a simple first-person caption in less than 20 words that is talking about the product. Use either {product_name} or {nickname} as the naming convention when referencing the product. ",
+            f"Choose which naming convention would suit the caption best, but do not use both.",
+            f"using first-person pronouns such as 'i', 'we', 'me', 'us', 'my'. ",
+            f"Use a random, casual persona and tone. ",
+            f"The caption should have a core message (examples: 'just copped', 'unboxed', 'obsessed with my new', 'loving my new', 'finally got these', 'got my hands on these') ",
+            f" and mention the product's details. It should also highlight features or colours, or share a story behind the purchase (examples: 'been waiting for these', 'finally got them'). ",
+            f"Avoid using words like 'stepping out', 'fresh', 'rock', 'swag', 'rad', 'trendy', 'streetwear', 'slayin', 'rocking', 'vibes', 'raddest', 'dope', 'exuding', 'rhythm', 'effortless', 'chic', 'adventures', 'awesome', 'strut'. ",
+            f"The less words the better. The sentences must be complete sentences. Do not always start the caption with 'finally got' and do not always say 'unreal'")
+    text = "".join(text)
+    return text
+
+def generate_caption(data):
+    product_name = data['product_name']
+    nickname = data['nickname']
+    try:# Generate caption using the prompt
+        caption = model.generate_content(prompt(product_name, nickname)).text
+        return caption
+    except ValueError as e:
+        print(f"Error: {e}")
+        return None
+    
+final_df1['caption'] = final_df1.apply(generate_caption, axis = 1)
+
+# Randomizing Plus Timestamps
+final_df1['user_id'] = int(696772)
+final_df1['product_tag_id'] = final_df1['Product ID']
+export_df = final_df1[['user_id', 'username', 'caption', 'image_urls', 'product_tag_id']]
+export_df = export_df.sample(frac=1).reset_index(drop = True)
+import numpy as np
+from datetime import datetime, timedelta
+
+# Function to generate random times within a given range
+def generate_random_times(start_time, end_time, num_times):
+    time_diff = end_time - start_time
+    random_times = [start_time + timedelta(seconds=np.random.randint(time_diff.total_seconds())) for _ in range(num_times)]
+    return random_times
+
+# Define your initial fixed start and end dates and times
+fixed_start_date = datetime(2024, 6, 4)
+
+# Number of rows and rows per pattern
+total_rows = len(export_df)  # Replace with your desired total number of rows
+rows_per_pattern = 20
+
+# Calculate the number of patterns
+num_patterns = total_rows // rows_per_pattern
+
+
+# Initialize an empty list to hold pattern DataFrames
+pattern_dfs = []
+
+for pattern_num in range(num_patterns):
+    # Fixed start date for the pattern
+    start_date = fixed_start_date + timedelta(days=pattern_num)
+    
+    # Fixed start time for the pattern
+    start_time = start_date + timedelta(seconds=np.random.randint(86400))  # Random time within the day
+    
+    # Fixed end time for the pattern
+    end_time = start_time.replace(hour=23, minute=59, second=59)
+    
+    # Generate random times for the middle rows
+    random_times = generate_random_times(start_time, end_time, rows_per_pattern - 2)
+    
+    # Concatenate the times for the pattern
+    times_for_pattern = [start_time] + random_times + [end_time]
+    
+    # Create a DataFrame for the pattern
+    pattern_df = pd.DataFrame({'time_to_post': times_for_pattern})
+    
+    # Append the pattern DataFrame to the list
+    pattern_dfs.append(pattern_df)
+
+# Concatenate all pattern DataFrames along rows
+time_df = pd.concat(pattern_dfs, ignore_index=True)
+export_df = pd.concat([export_df, time_df], axis = 1)
